@@ -1,9 +1,13 @@
-import sys, os
+import sys
 import json
-import tensorly as tl
-import optuna
+import warnings
 import numpy as np
 import polars as pl
+import pandas as pd
+import tensorly as tl
+from functools import partial
+from joblib import Parallel, delayed
+import tqdm
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -16,8 +20,6 @@ tl.set_backend('numpy')
 set_num_threads(-1)
 debug(third_party=True)
 
-import warnings
-warnings.filterwarnings('ignore')
 
 work_dir = 'projects/def-wainberg/karbabi/AD-subtyping'
 data_dir = 'projects/def-wainberg/single-cell'
@@ -88,98 +90,139 @@ def normalize_tensor_dict(tensor_dict, min_shift=False):
     return tensor_dict
 
 def tucker_ica(tensor, ranks, random_state=None):
-    from sklearn.decomposition import FastICA, FactorAnalysis
-    # tucker decomposition to get initial factors
+    from sklearn.decomposition import FastICA
+    from scipy.linalg import svd
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+    # initial tucker decomposition
     _, factors = tl.decomposition.tucker(
-        tensor, rank=ranks, random_state=random_state)
-    
-    # apply ICA to gene factors and normalize to unit vectors
-    ica = FastICA(n_components=ranks[1], random_state=random_state)
-    gene_factors = ica.fit_transform(factors[1])
-    gene_factors /= np.sqrt(np.sum(gene_factors**2, axis=0))
-    
-    # compute rotated core tensor
-    kron_prod = np.kron(np.eye(ranks[2]), gene_factors)
-    kron_prod = kron_prod.reshape(-1, ranks[1] * ranks[2])    
-    core_new = factors[0].T @ tl.unfold(tensor, 0) @ kron_prod
-    core_new = core_new.reshape(ranks[0], ranks[1], ranks[2])
-    
-    # apply varimax rotation to sample mode
-    fa = FactorAnalysis(
-        n_components=ranks[0], rotation='varimax', random_state=random_state)
-    fa.fit(core_new.reshape(ranks[0], -1).T)    
-    donor_mat = factors[0] @ fa.components_.T
-    core_rotated = np.tensordot(fa.components_, core_new, axes=(1,0))
+        tensor, rank=ranks, init='svd', random_state=random_state)
+    donor_mat, gene_mat, ct_mat = factors
 
-    return core_rotated, [donor_mat, gene_factors, np.eye(ranks[2])]
+    # ica on gene factors 
+    ica = FastICA(n_components=ranks[1], 
+                  random_state=random_state, 
+                  tol=1e-3,
+                  max_iter=1000)
+    gene_factors = ica.fit_transform(gene_mat)
+    norms = np.sqrt(np.sum(gene_factors**2, axis=0))
+    gene_factors = gene_factors / norms[None, :]
 
-def objective(trial, tensor_dict, search_space, MSE_trial=None, n_reps=3,
-              test_size=0.1):
-    from sklearn.model_selection import train_test_split
+    # compute unrotated loadings 
+    kron_prod = np.kron(gene_factors, ct_mat)
+    core_unrotated = donor_mat.T @ tl.unfold(tensor, 0) @ kron_prod
+    loadings_unrotated = core_unrotated @ kron_prod.T
 
-    rank_samples = trial.suggest_int(
-        'rank_samples', *search_space['rank_samples'])
-    rank_genes = trial.suggest_int(
-        'rank_genes', *search_space['rank_genes'])
-    tensor = tensor_dict['tensor']
-    ranks = [rank_samples, rank_genes, tensor.shape[2]]
+    # varimax rotation
+    def varimax(Phi, gamma=1.0, q=100, tol=1e-15):
+        p,k = Phi.shape
+        R = np.eye(k)
+        d = 0
+        for _ in range(q):
+            d_old = d
+            Lambda = Phi @ R
+            u,s,vh = svd(
+                Phi.T @ (Lambda**3 - (gamma/p) *
+                         Lambda @ np.diag(np.diag(Lambda.T @ Lambda))))
+            R = u @ vh
+            d = np.sum(s)
+            if d_old!=0 and d/d_old < 1 + tol: break
+        return Phi @ R, R
 
-    mses = []
-    for rep in range(1, n_reps + 1):
-        sample_train, sample_test = train_test_split(
-            range(tensor.shape[0]), 
-            test_size=test_size, 
-            random_state=rep*rank_genes*rank_samples)
-        train_tensor = tensor[sample_train]
-        test_tensor = tensor[sample_test]
+    core_reshaped = core_unrotated.reshape(ranks[0], -1)
+    core_rotated, rot_mat = varimax(core_reshaped.T) 
+    core_rotated = core_rotated.T.reshape(ranks[0], ranks[1], ranks[2])
+    donor_scores = donor_mat @ np.linalg.inv(rot_mat)
+
+    return core_rotated, [donor_scores, gene_factors, ct_mat], \
+        loadings_unrotated, rot_mat
+
+def run_trial(params, tensor_dict, n_folds=5, base_seed=42, verbose=False):
+    from sklearn.model_selection import KFold
+    rank_samples, rank_genes = params
+    try:
+        tensor = tensor_dict['tensor']
+        ranks = [rank_samples, rank_genes, tensor.shape[2]]
+
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=base_seed)
         
-        core, factors = tucker_ica(
-            train_tensor, ranks, random_state=rep*rank_samples*rank_genes)
-        
-        loadings = tl.tenalg.multi_mode_dot(
-            core, [factors[1], factors[2]], modes=[1, 2])
-        loadings_mat = tl.unfold(loadings, mode=0)
-        test_unfolded = tl.unfold(test_tensor, mode=0)
-        test_coords = test_unfolded @ np.linalg.pinv(loadings_mat)
-        recon_tensor = tl.tucker_to_tensor((
-            core, [test_coords, factors[1], factors[2]]))
-        
-        mse = tl.metrics.regression.MSE(test_tensor, recon_tensor)
-        print(f'{rep}: {rank_samples=}, {rank_genes=}: {mse=}')
-        mses.append(mse)
+        mses = []
+        for fold, (train_idx, test_idx) in enumerate(
+            kf.split(range(tensor.shape[0]))):
 
-    mse = np.mean(mses); se = np.std(mses)
-    MSE_trial[(rank_samples, rank_genes)] = (mse, se)
-    return mse
+            train_tensor = tensor[train_idx]
+            test_tensor = tensor[test_idx]
+            core_rotated, factors, loadings_unrotated, rot_mat = \
+                tucker_ica(train_tensor, ranks, random_state=base_seed+fold)
+            
+            test_unfolded = tl.unfold(test_tensor, 0)
+            test_coords = test_unfolded @ np.linalg.pinv(loadings_unrotated)
+            test_coords = test_coords @ rot_mat
+            
+            recon_tensor = tl.tucker_to_tensor((
+                core_rotated, 
+                [test_coords, factors[1], factors[2]]))
+            mse = tl.metrics.regression.MSE(test_tensor, recon_tensor)
+            if verbose:
+                print(f'Fold {fold+1}: {rank_samples=}, {rank_genes=}: {mse=}')
+            mses.append(mse)
 
-def plot_rank_grid(MSE_trial, best_params, filename):
+        mse = np.mean(mses)
+        se = np.std(mses)
+        return (rank_samples, rank_genes), (mse, se)
+    except: 
+        print(f'Failed: {rank_samples=}, {rank_genes=}')
+        return (rank_samples, rank_genes), (float('inf'), 0)
+
+def find_simple_ranks(results, tolerance_se=1.0):
+
+    MSE_trial = dict(results) if not isinstance(results, dict) else results    
+
+    best_params_tuple = min(MSE_trial.items(), key=lambda x: x[1][0])
+    best_mse, best_se = best_params_tuple[1]
+    best_params = {
+        'rank_samples': best_params_tuple[0][0],
+        'rank_genes': best_params_tuple[0][1]
+    }    
+    simple_ranks = min(
+        [(rs, rg) for (rs, rg), (mse, _) in MSE_trial.items() 
+         if mse <= best_mse + tolerance_se * best_se],
+        key=lambda x: x[0] + x[1]  # minimize sum of ranks
+    )
+    return {
+        'best_params': best_params,
+        'best_mse': best_mse,
+        'best_se': best_se,
+        'simple_ranks': simple_ranks
+    }
+
+def plot_rank_grid(MSE_trial, simple_ranks, filename, log_norm=True):
+
     from matplotlib.colors import LogNorm
     ranks_s = sorted(set(k[0] for k in MSE_trial.keys()))
     ranks_g = sorted(set(k[1] for k in MSE_trial.keys()))
     results = np.zeros((len(ranks_s), len(ranks_g)))
     
-    for (rs, rg), (mse, se) in MSE_trial.items():
+    for (rs, rg), (mse, _) in MSE_trial.items():
         results[ranks_s.index(rs), ranks_g.index(rg)] = mse
-
-    best_mse, best_se = MSE_trial[(
-        best_params['rank_samples'], best_params['rank_genes'])]
-    simple_ranks = min([(rs, rg) for (rs, rg), (mse, _) in MSE_trial.items() 
-                       if mse <= best_mse + best_se], 
-                      key=lambda x: x[0] + x[1])
     
     plt.figure(figsize=(10, 8))
     sns.heatmap(results, 
                 cmap='viridis', 
                 xticklabels=ranks_g, 
                 yticklabels=ranks_s, 
-                norm=LogNorm())
+                norm=LogNorm() if log_norm else None)
+    
+    # Plot selected ranks
     g_idx = ranks_g.index(simple_ranks[1])
     s_idx = ranks_s.index(simple_ranks[0])
     plt.plot(g_idx, s_idx, 'r*', markersize=15)
     plt.text(g_idx + 0.2, s_idx - 0.2, 
              f'({simple_ranks[0]}, {simple_ranks[1]})', 
              color='red')
-    plt.xlabel('Gene Rank'); plt.ylabel('Sample Rank')
+    plt.xlabel('Gene Rank')
+    plt.ylabel('Sample Rank')
     plt.title('MSE across rank combinations')
     savefig(filename)
 
@@ -215,7 +258,6 @@ de_genes = {
 }
 print(json.dumps({ct: len(genes) for ct, genes in de_genes.items()}, indent=2))
 
-
 study = 'Green'
 pb = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')\
         .qc(group_column=coefficient, 
@@ -241,32 +283,40 @@ tensor_dict = normalize_tensor_dict(tensor_dict, min_shift=False)
 print(tensor_dict['tensor'].shape)
 print(np.max(tensor_dict['tensor']), np.min(tensor_dict['tensor']))
 
-MSE_trial = {}
-search_space = {'rank_samples': (5, 100, 5), 'rank_genes': (5, 100, 5)}
-study = optuna.create_study(
-    sampler=optuna.samplers.GridSampler(
-        {k: [i for i in range(*v)] for k,v in search_space.items()},
-        seed=42), 
-    direction='minimize')
-study.optimize(
-    lambda trial: objective(
-        trial, tensor_dict, search_space, MSE_trial),
-    n_trials=len(range(*search_space['rank_samples'])) * 
-        len(range(*search_space['rank_genes'])))
+search_space = {'rank_samples': (10, 400, 10), 
+                'rank_genes': (50, 1500, 50)}
+rank_samples = range(*search_space['rank_samples'])
+rank_genes = range(*search_space['rank_genes'])
+param_combinations = [(rs, rg) for rs in rank_samples for rg in rank_genes]
 
+run_trial_partial = partial(
+    run_trial, 
+    tensor_dict=tensor_dict,
+    n_folds=5,
+    base_seed=42)
+
+print(f'Starting grid search with {len(param_combinations)} combinations...')
+results = Parallel(n_jobs=52)(
+    delayed(run_trial_partial)(params) 
+    for params in tqdm.tqdm(param_combinations, desc='Grid search'))
+
+rank_analysis = find_simple_ranks(results)
 plot_rank_grid(
-    MSE_trial, study.best_params, 
-    f'{work_dir}/figures/rank_selection_de_padded.png')
+    dict(results),
+    rank_analysis['simple_ranks'],
+    f'{work_dir}/figures/rank_selection_pad_mean_small_project_k5.png',
+    log_norm=True)
 
 
 
 
-data = tl.unfold(recon_tensor, mode=0).T
-data = data[~np.all(data == 0, axis=1), :]
+
+
+
+data = tl.unfold(tensor, mode=2).T
+data = factors[0]
 
 print(data.shape)
-import sys
-sys.setrecursionlimit(10000)
 
 plt.figure(figsize=(8, 15))
 sns.heatmap(data, 
@@ -275,8 +325,10 @@ sns.heatmap(data,
             robust=True,
             xticklabels=False,
             yticklabels=False)
-savefig(f'{work_dir}/figures/tmp1.png')
+savefig(f'{work_dir}/figures/tmp2.png')
 
+import sys
+sys.setrecursionlimit(10000)
 plt.figure(figsize=(8, 15))
 sns.clustermap(data,
                cmap='RdBu_r', 
@@ -284,9 +336,4 @@ sns.clustermap(data,
                robust=True,
                xticklabels=False,
                yticklabels=False)
-savefig(f'{work_dir}/figures/tmp1_clust.png')
-
-
-
-
-
+savefig(f'{work_dir}/figures/tmp8_clust.png')
