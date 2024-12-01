@@ -160,11 +160,11 @@ for level in ['broad', 'fine']:
                     .when(pl.col.cogdx.is_in([4, 5])).then(2)
                     .otherwise(None)
                     .alias('dx_cogn'),
-                pl.col.apoe_genotype.cast(pl.String) # 1 missing filled
+                pl.col.apoe_genotype.cast(pl.String) # filled 1 missing
                     .str.count_matches('4').fill_null(strategy='mean')
                     .round()
                     .alias('apoe4_dosage'),  
-                pl.col.pmi.fill_null(strategy='mean') # 1 missing filled
+                pl.col.pmi.fill_null(strategy='mean') # filled 1 missing 
                     .alias('pmi'),
                 pl.when(pl.col.msex.eq(1)).then(pl.lit('M'))
                     .when(pl.col.msex.eq(0)).then(pl.lit('F'))
@@ -266,11 +266,11 @@ for level in ['broad', 'fine']:
                     .otherwise(None)
                     .alias('dx_cogn'),
                 pl.coalesce(['apoe_genotype_right', 'apoe_genotype']) 
-                    .cast(pl.String).str.count_matches('4') # 2 missing filled
+                    .cast(pl.String).str.count_matches('4') # filled 2 missing 
                     .fill_null(strategy='mean')
                     .round()
                     .alias('apoe4_dosage'),
-                pl.coalesce(['pmi_right', 'pmi']) # 1 missing filled
+                pl.coalesce(['pmi_right', 'pmi']) # filled 1 missing 
                     .fill_null(strategy='mean')
                     .alias('pmi'),
                 pl.when(pl.coalesce(['msex_right', 'msex']).eq(1))
@@ -308,9 +308,8 @@ sc_dir = f'projects/def-wainberg/single-cell/{study_name}'
 with Timer(f'[{study_name}] Loading single cell'):
     sc = SingleCell(
         f'{sc_dir}/SEAAD_DLPFC_RNAseq_all-nuclei.2024-02-13.h5ad')\
-        .cast_obs({
-            'Donor ID': pl.String, 'Class': pl.String, 
-            'Subclass': pl.String})
+        .cast_obs({'Donor ID': pl.String, 'Class': pl.String, 
+                   'Subclass': pl.String})
     donor_metadata = pl.read_excel(
         f'{sc_dir}/sea-ad_cohort_donor_metadata.xlsx')
     pseudoprogression_scores = pl.read_csv(
@@ -324,15 +323,27 @@ with Timer(f'[{study_name}] Loading single cell'):
         .with_columns_obs(
             pl.coalesce(
                 pl.col('Subclass').replace_strict({
-                    'Astro': 'Astrocytes', 'Endo': 'Endothelial', 
-                    'Micro-PVM': 'Microglia', 'Oligo': 'Oligodendrocytes',
-                    'OPC': 'OPCs', 'VLMC': 'Endothelial'},
+                    'Astro': 'Astrocyte', 
+                    'Endo': 'Endothelial', 
+                    'Micro-PVM': 'Microglia-PVM', 
+                    'Oligo': 'Oligodendrocyte',
+                    'OPC': 'OPC', 
+                    'VLMC': 'Endothelial'},
                     default=None),
                 pl.col('Class').replace_strict({
-                    'exc': 'Excitatory', 'inh': 'Inhibitory'}, 
+                    'exc': 'Excitatory', 
+                    'inh': 'Inhibitory'}, 
                     default=None))
                 .alias('cell_type_broad'),
-            pl.col('Subclass').alias('cell_type_fine'),
+            pl.col('Subclass').replace_strict({
+                'Astro': 'Astrocyte', 
+                'Endo': 'Endothelial', 
+                'Micro-PVM': 'Microglia-PVM', 
+                'Oligo': 'Oligodendrocyte',
+                'OPC': 'OPC', 
+                'VLMC': 'Endothelial'},
+                default=pl.col('Subclass'))
+                .alias('cell_type_fine'),
             pl.col('Subclass confidence').ge(0.9)
                 .alias('passed_cell_type_fine'))\
         .qc(custom_filter=pl.col('Class confidence').ge(0.9) &
@@ -348,8 +359,7 @@ for level in ['broad', 'fine']:
                 cell_type_column=f'cell_type_{level}',
                 QC_column='passed_cell_type_fine' if level == 'fine' else None,
                 sort_genes=True)\
-            .filter_obs(pl.col.ID.is_in([
-                'H18.30.002', 'H19.30.002', 'H19.30.001']).not_())\
+            .filter_obs(pl.col('Neurotypical reference').eq('False'))\
             .with_columns_obs(
                 pl.when(
                     pl.col('Consensus Clinical Dx (choice=Alzheimers disease)')
@@ -357,25 +367,157 @@ for level in ['broad', 'fine']:
                     .when(pl.col('Consensus Clinical Dx (choice=Control)')
                     .eq('Checked')).then(0)
                     .otherwise(None)
-                    .alias('dx_cc'),
-                pl.when(
-                    pl.col('Overall AD neuropathological Change')
-                    .eq('Not AD')).then(0)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('Low')).then(1)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('Intermediate')).then(2)
-                    .when(pl.col('Overall AD neuropathological Change')
-                    .eq('High')).then(3)
-                    .otherwise(None)
-                    .alias('dx_adnc'),
+                    .alias('Consensus Clinical AD'),
+                pl.col('Overall AD neuropathological Change').cast(pl.String)
+                    .replace_strict({
+                        'Not AD': 0, 'Low': 1, 'Intermediate': 2, 'High': 3},
+                        default=None),
+                pl.col('CERAD score').cast(pl.String)
+                    .replace_strict({
+                        'Absent': 0, 'Sparse': 1, 'Moderate': 2, 'Frequent': 3},
+                        default=None),
+                pl.col('Overall CAA Score')
+                    .cast(pl.String)
+                    .replace_strict({
+                        'Not identified': 0, 'Mild': 1, 'Moderate': 2, 
+                        'Severe': 3},
+                        default=None),
+                pl.col('Atherosclerosis')
+                    .cast(pl.String)
+                    .replace_strict({
+                        'None': 0, 'Mild': 1, 'Moderate': 2, 'Severe': 3},
+                        default=None),
+                pl.col('Arteriolosclerosis')
+                    .cast(pl.String)
+                    .replace_strict({
+                        'Mild': 1, 'Moderate': 2, 'Severe': 3},
+                        default=None),
+                pl.col('LATE')
+                    .cast(pl.String)
+                    .replace_strict({
+                        'Not Identified': 0, 'LATE Stage 1': 1,
+                        'LATE Stage 2': 2, 'LATE Stage 3': 3},
+                        default=None),
+                pl.col('Cognitive Status')
+                    .cast(pl.String)
+                    .replace_strict({
+                        'No dementia': 0, 'Dementia': 1},
+                        default=None),
+                pl.col('Thal')
+                    .cast(pl.String)
+                    .str.extract_all(r'(\d+)')
+                    .list.first()
+                    .cast(pl.Int32),
+                pl.col('Severely Affected Donor')
+                    .cast(pl.String)
+                    .replace_strict({'N': 0, 'Y': 1}, default=None),
+                pl.col('Known head injury')
+                    .cast(pl.String)
+                    .replace_strict({'No': 0, 'Yes': 1}, default=None),
                 pl.col('APOE Genotype')
-                    .cast(pl.String).str.count_matches('4')
+                    .cast(pl.String)
+                    .str.count_matches('4')
                     .fill_null(strategy='mean')
                     .round()
-                    .alias('apoe4_dosage'))\
+                    .alias('APOE4_Dosage'),
+                pl.col('Continuous Pseudo-progression Score')
+                    .alias('CPS'),
+                pl.col('Age at Death')
+                    .alias('Age_death'),
+                pl.col('PMI')
+                    .cast(pl.Float64)
+                    .alias('PMI'))\
             .filter_var(pl.col._index.is_in(get_coding_genes()['gene']))
 
         pb.save(f'{sc_dir}/pseudobulk/{level}', overwrite=True)
 
 del sc, pb; gc.collect()
+
+
+print(pb.obs['Astrocyte'].schema)
+
+
+['ID',
+ 'num_cells',
+ 'Neurotypical reference',
+ 'Organism',
+ 'Brain Region',
+ 'Sex',
+ 'Gender',
+ 'Age at Death',
+ 'Race (choice=White)',
+ 'Race (choice=Black/ African American)',
+ 'Race (choice=Asian)',
+ 'Race (choice=American Indian/ Alaska Native)',
+ 'Race (choice=Native Hawaiian or Pacific Islander)',
+ 'Race (choice=Unknown or unreported)',
+ 'Race (choice=Other)',
+ 'specify other race',
+ 'Hispanic/Latino',
+ 'Highest level of education',
+ 'Years of education',
+ 'PMI',
+ 'Fresh Brain Weight',
+ 'Brain pH',
+ 'Overall AD neuropathological Change',
+ 'Thal',
+ 'Braak',
+ 'CERAD score',
+ 'Overall CAA Score',
+ 'Highest Lewy Body Disease',
+ 'Total Microinfarcts (not observed grossly)',
+ 'Total microinfarcts in screening sections',
+ 'Atherosclerosis',
+ 'Arteriolosclerosis',
+ 'LATE',
+ 'Cognitive Status',
+ 'Last CASI Score',
+ 'Interval from last CASI in months',
+ 'Last MMSE Score',
+ 'Interval from last MMSE in months',
+ 'Last MOCA Score',
+ 'Interval from last MOCA in months',
+ 'APOE Genotype',
+ 'Primary Study Name',
+ 'Secondary Study Name',
+ 'cell_prep_type',
+ 'rna_amplification_pass_fail',
+ 'library_prep_pass_fail',
+ 'Genome',
+ 'Used in analysis',
+ 'Severely Affected Donor',
+ 'Known head injury',
+ 'Consensus Clinical Dx (choice=Frontotemporal lobar degeneration)',
+ 'Age of Dementia diagnosis',
+ 'Consensus Clinical Dx (choice=Prion)',
+ 'Consensus Clinical Dx (choice=Progressive Supranuclear Palsy)',
+ 'Consensus Clinical Dx (choice=Taupathy)',
+ 'Consensus Clinical Dx (choice=Alzheimers disease)',
+ 'Have they had neuroimaging',
+ 'Consensus Clinical Dx (choice=Dementia with Lewy Bodies/ Lewy Body Disease)',
+ 'Consensus Clinical Dx (choice=Parkinsons disease)',
+ 'Rapid Frozen Tissue Type',
+ 'RIN',
+ 'Consensus Clinical Dx (choice=Unknown)',
+ 'Consensus Clinical Dx (choice=Motor Neuron disease)',
+ 'Consensus Clinical Dx (choice=Alzheimers Possible/ Probable)',
+ 'Consensus Clinical Dx (choice=Vascular Dementia)',
+ 'APOE4 Status',
+ 'Consensus Clinical Dx (choice=Multiple System Atrophy)',
+ 'Consensus Clinical Dx (choice=Parkinsons Cognitive Impairment - no dementia)',
+ 'Age of onset cognitive symptoms',
+ 'Consensus Clinical Dx (choice=Control)',
+ 'Consensus Clinical Dx (choice=Huntingtons disease)',
+ 'Consensus Clinical Dx (choice=Ataxia)',
+ 'Consensus Clinical Dx (choice=Corticobasal Degeneration)',
+ 'Consensus Clinical Dx (choice=Parkinsons Disease Dementia)',
+ 'Ex Vivo Imaging',
+ 'If other Consensus dx, describe',
+ 'Consensus Clinical Dx (choice=Other)',
+ 'Continuous Pseudo-progression Score']
+
+consensus_cols = [col for col in pb.obs['Astrocyte'].columns 
+                 if col.startswith('Consensus Clinical Dx')]
+for col in consensus_cols:
+    print(f'\n{col}:')
+    print(pb.obs['Astrocyte'][col].value_counts())

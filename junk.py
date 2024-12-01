@@ -789,3 +789,366 @@ study.optimize(
         trial, tensor_dict, search_space, MSE_trial),
     n_trials=len(range(*search_space['rank_samples'])) * 
         len(range(*search_space['rank_genes'])))
+
+
+
+# Calculate gene-factor associations using R's lm function
+def get_lm_pvals(tensor_dict):
+    from utils import fdr
+    
+    tensor = tensor_dict['tensor']
+    scores = tensor_dict['decomposition']['factors']['donors']
+    genes = tensor_dict['dims']['genes']
+    cell_types = tensor_dict['dims']['cell_types']
+    to_r(scores, 'scores')
+    
+    results = []
+    r('n_factors <- ncol(scores)')   
+
+    for j, ct in enumerate(cell_types):
+        for i, gene in enumerate(genes):
+            fiber = tensor[:, i, j]
+            if np.all(fiber == 0): continue
+                
+            to_r(fiber, 'fiber')
+            r('''
+            stats <- lapply(1:n_factors, function(k) {
+                fit <- lm(scores[,k] ~ fiber)
+                summ <- summary(fit)
+                f_stat <- summ$fstatistic
+                list(
+                    pval = pf(
+                        f_stat[1], f_stat[2], f_stat[3], 
+                        lower.tail=FALSE),
+                    r2 = summ$r.squared,
+                    beta = coef(fit)[2],
+                    se = summ$coefficients[2,2]
+                )
+            })
+            ''')
+            for k in range(scores.shape[1]):
+                stats = to_py(f'stats[[{k+1}]]')
+                if not np.isnan(stats['pval']):
+                    results.append({
+                        'gene': gene, 'cell_type': ct, 'factor': k,
+                        'pvalue': stats['pval'], 'r2': stats['r2'],
+                        'beta': stats['beta'], 'beta_se': stats['se']
+                    })
+        
+    tensor_dict['gene_associations'] = pl.DataFrame(results)\
+        .with_columns(fdr(pl.col('pvalue')).alias('padj'))
+    return tensor_dict
+
+
+level = 'broad'
+coefficient = 'pmAD'
+
+pb_dict = {}; de_dict = {}
+for study in ['Green', 'Mathys']:
+    pb_dict[study] = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')\
+        .qc(group_column=pl.col(coefficient),
+            verbose=False)
+    de_dict[study] = pb_dict[study]\
+        .filter_var(pl.col('_index').is_in(get_coding_genes()['gene']))\
+        .DE(formula=f'~ {coefficient} + age_death + sex + pmi + apoe4_dosage',
+            coefficient=coefficient,
+            group=coefficient,
+            verbose=False)
+    print_df(de_dict[study].get_num_hits(threshold=0.1).sort('cell_type'))
+
+de_genes = {
+    cell_type: (
+        de_dict['Green'].table
+            .filter(pl.col.cell_type.eq(cell_type))
+            .join(de_dict['Mathys'].table.filter(pl.col.cell_type.eq(cell_type)),
+                  on=['cell_type', 'gene'], 
+                  how='inner')
+            .filter((pl.col.FDR.lt(0.20) & pl.col.p_right.lt(0.05)) | 
+                    (pl.col.FDR_right.lt(0.20) & pl.col.p.lt(0.05)))
+            .filter(pl.col.logFC_right * pl.col.logFC > 0)
+            .get_column('gene').to_list())
+    for cell_type in de_dict['Green'].table['cell_type'].unique()
+}
+print(json.dumps({ct: len(genes) for ct, genes in de_genes.items()}, indent=2))
+
+# # union of qc passing genes
+# genes = sorted(set.union(*[
+#     set(pb[ct].var[ct]['_index']) for ct in pb.keys()
+# ]))
+# print(len(genes))
+
+
+
+# Plot gene loadings heatmap for each factor across cell type
+def plot_gene_heatmap(tensor_dict, filename, n_genes_per_factor=10):
+    loading_tensor = tensor_dict['decomposition']['loadings']['tensor']
+    n_factors = loading_tensor.shape[0]
+    genes = tensor_dict['dims']['genes']
+    cell_types = tensor_dict['dims']['cell_types']
+    
+    # Get top genes based on loading magnitudes for each factor-cell type combo
+    top_genes = {}
+    for f in range(n_factors):
+        factor_loadings = loading_tensor[f]  
+        top_genes[str(f)] = []
+        
+        for ct_idx in range(factor_loadings.shape[1]):
+            ct_loadings = np.abs(factor_loadings[:, ct_idx])
+            top_indices = np.argsort(ct_loadings)[-n_genes_per_factor:]
+            top_genes[str(f)].extend([genes[i] for i in top_indices])
+
+        top_genes[str(f)] = list(dict.fromkeys(top_genes[str(f)]))
+    
+    r('''
+    suppressPackageStartupMessages({
+        library(ComplexHeatmap)
+        library(circlize)
+        library(grid)
+        library(ggpubr)
+    })
+    plot_list <- list()
+    ''')
+    
+    for f in range(n_factors):
+        factor_loadings = loading_tensor[f]
+        to_r(factor_loadings, 'loadings_mat', 
+             rownames=genes, colnames=cell_types)
+        to_r({str(f): top_genes[str(f)]}, 'top_genes')
+        
+        r(f'''
+        color_lim <- quantile(abs(loadings_mat), 0.99)
+        col_fun = colorRamp2(c(-color_lim, 0, color_lim), 
+                           c('blue', 'white', 'red'))
+        
+        row_annot = rowAnnotation(
+            foo = anno_mark(
+                at = which(rownames(loadings_mat) %in% unlist(top_genes)),
+                labels = rownames(loadings_mat)[which(
+                    rownames(loadings_mat) %in% unlist(top_genes))],
+                labels_gp = gpar(fontsize = 8)
+            )
+        )
+        ht = Heatmap(
+            loadings_mat,
+            name = paste('Loading', {f}),
+            col = col_fun,
+            show_row_names = FALSE, 
+            show_column_names = TRUE,
+            column_names_gp = gpar(fontsize = 12),
+            column_names_rot = 45,
+            right_annotation = row_annot,
+            clustering_method_rows = 'ward.D2',
+            cluster_columns = FALSE,
+            column_title = paste('Factor', {f+1}),
+            column_title_gp = gpar(fontsize = 20, fontface = 'bold'),
+            row_title = 'Genes',
+            row_title_gp = gpar(fontsize = 14),
+            border = TRUE)
+
+        plot_list[[{f+1}]] <- grid.grabExpr(draw(ht))
+        ''')
+    
+    r(f'''
+    n_factors = length(plot_list)
+    n_cols = min(3, n_factors)
+    n_rows = ceiling(n_factors / n_cols)
+    
+    combined_plot <- ggarrange(
+        plotlist = plot_list, 
+        ncol = n_cols, 
+        nrow = n_rows)
+    
+    ggsave('{filename}', combined_plot,
+           width = 6.75 * n_cols + 2,
+           height = 30,
+           dpi = 600,
+           limitsize = FALSE)
+    ''')
+
+# Calculate gene-factor associations using R's lm function
+def get_lm_pvals(tensor_dict):
+    from utils import fdr
+    
+    tensor = tensor_dict['tensor']
+    scores = tensor_dict['decomposition']['factors']['donors']
+    genes = tensor_dict['dims']['genes']
+    cell_types = tensor_dict['dims']['cell_types']
+    to_r(scores, 'scores')
+    
+    results = []
+    r('n_factors = ncol(scores)')   
+
+    for j, ct in enumerate(cell_types):
+        for i, gene in enumerate(genes):
+            fiber = tensor[:, i, j]
+            if np.all(fiber == 0): continue
+                
+            to_r(fiber, 'fiber')
+            r('''
+            stats = lapply(1:n_factors, function(k) {
+                fit = lm(scores[,k] ~ fiber)
+                summ = summary(fit)
+                f_stat = summ$fstatistic
+                list(
+                    pval = pf(
+                        f_stat[1], f_stat[2], f_stat[3], 
+                        lower.tail=FALSE),
+                    r2 = summ$r.squared,
+                    beta = coef(fit)[2],
+                    se = summ$coefficients[2,2]
+                )
+            })
+            ''')
+            for k in range(scores.shape[1]):
+                stats = to_py(f'stats[[{k+1}]]')
+                if not np.isnan(stats['pval']):
+                    results.append({
+                        'gene': gene, 'cell_type': ct, 'factor': k,
+                        'pvalue': stats['pval'], 'r2': stats['r2'],
+                        'beta': stats['beta'], 'beta_se': stats['se']
+                    })
+        
+    tensor_dict['gene_associations'] = pl.DataFrame(results)\
+        .with_columns(fdr(pl.col('pvalue')).alias('padj'))
+    return tensor_dict
+
+
+
+
+def plot_gene_loadings_heatmap(tensor_dict, filename, n_genes_per_factor=10,
+                              use_sig_only=False, nonsig_to_zero=False):
+    loading_tensor = tensor_dict['decomposition']['loadings']['tensor']
+    n_factors = loading_tensor.shape[0]
+    genes = tensor_dict['dims']['genes']
+    cell_types = tensor_dict['dims']['cell_types']
+    
+    # Get genes to highlight based on significance or loading magnitude
+    highlight_genes = {}
+    for f in range(n_factors):
+        if use_sig_only:
+            sig_df = tensor_dict['gene_associations']\
+                .filter(pl.col('factor') == f)\
+                .filter(pl.col('padj') < 0.1)\
+                .sort('padj')\
+                .head(n_genes_per_factor)\
+                .get_column('gene')
+            highlight_genes[str(f)] = sig_df.to_list()
+        else:
+            factor_loadings = loading_tensor[f]
+            highlight_genes[str(f)] = []
+            for ct_idx in range(factor_loadings.shape[1]):
+                ct_loadings = np.abs(factor_loadings[:, ct_idx])
+                top_idx = np.argsort(ct_loadings)[-n_genes_per_factor:]
+                highlight_genes[str(f)].extend([genes[i] for i in top_idx])
+            highlight_genes[str(f)] = list(dict.fromkeys(highlight_genes[str(f)]))
+    
+    r('''
+    suppressPackageStartupMessages({
+        library(ComplexHeatmap)
+        library(circlize)
+        library(grid)
+        library(ggpubr)
+    })
+    plot_list = list()
+    ''')
+    
+    for f in range(n_factors):
+        factor_loadings = loading_tensor[f]
+        if nonsig_to_zero and use_sig_only:
+            mask = ~np.isin(genes, highlight_genes[str(f)])
+            factor_loadings = factor_loadings.copy()
+            factor_loadings[mask] = 0
+            
+        to_r(factor_loadings, 'loadings_mat', 
+             rownames=genes, colnames=cell_types)
+        to_r({str(f): highlight_genes[str(f)]}, 'highlight_genes')
+        
+        r(f'''
+        max_val = max(abs(loadings_mat))
+        if (max_val == 0) {{
+            color_lim = 1
+        }} else {{
+            color_lim = quantile(abs(loadings_mat[loadings_mat != 0]), 0.99)
+        }}
+        col_fun = colorRamp2(c(-color_lim, 0, color_lim), 
+                           c('blue', 'white', 'red'))
+        
+        row_annot = rowAnnotation(
+            foo = anno_mark(
+                at = which(rownames(loadings_mat) %in% unlist(highlight_genes)),
+                labels = rownames(loadings_mat)[which(
+                    rownames(loadings_mat) %in% unlist(highlight_genes))],
+                labels_gp = gpar(fontsize = 8)
+            )
+        )
+        ht = Heatmap(
+            loadings_mat,
+            name = paste('Loading', {f}),
+            col = col_fun,
+            show_row_names = FALSE, 
+            show_column_names = TRUE,
+            column_names_gp = gpar(fontsize = 12),
+            column_names_rot = 45,
+            right_annotation = row_annot,
+            clustering_method_rows = 'ward.D2',
+            cluster_columns = FALSE,
+            column_title = paste('Factor', {f+1}),
+            column_title_gp = gpar(fontsize = 20, fontface = 'bold'),
+            row_title = 'Genes',
+            row_title_gp = gpar(fontsize = 14),
+            border = TRUE)
+
+        plot_list[[{f+1}]] = grid.grabExpr(draw(ht))
+        ''')
+    
+    r(f'''
+    n_factors = length(plot_list)
+    n_cols = min(3, n_factors)
+    n_rows = ceiling(n_factors / n_cols)
+    
+    combined_plot = ggarrange(
+        plotlist = plot_list, 
+        ncol = n_cols, 
+        nrow = n_rows)
+    
+    ggsave('{filename}', combined_plot,
+           width = 6.75 * n_cols + 2,
+           height = 30,
+           dpi = 300,
+           limitsize = FALSE)
+    ''')
+
+tensor_dict['sig_gene_counts'] = tensor_dict['gene_associations']\
+    .filter(pl.col('padj') < 0.10)\
+    .group_by(['cell_type', 'factor'])\
+    .agg(pl.count().alias('n_sig_genes'))\
+    .sort(['factor', 'cell_type'])
+print('\nSignificant genes (FDR < 0.10) per cell type and factor:')
+print_df(tensor_dict['sig_gene_counts'])
+
+
+
+sc_obs = SingleCell.read_obs(
+    f'{data_dir}/{study_name}/{study_name}_qced_labelled.h5ad')
+
+base_FDR, alpha, max_FDR = 0.05, 0.6, 0.3
+
+proportions = sc_obs\
+    .group_by(['projid', f'cell_type_{level}'])\
+    .len()\
+    .with_columns(
+        (pl.col('len') / pl.col('len').sum().over('projid'))
+        .alias('proportion'))\
+    .group_by(f'cell_type_{level}')\
+    .agg(pl.median('proportion'))\
+    .to_dict(as_series=False)
+
+fdr_thresholds = {
+    ct: min(base_FDR * (1 / prop) ** alpha, max_FDR)
+    for ct, prop in zip(proportions[f'cell_type_{level}'],
+                        proportions['proportion'])
+}
+print(json.dumps({ct: f'{fdr:.2f}' 
+                  for ct, fdr in fdr_thresholds.items()}, indent=2))
+
+# (pl.col('FDR') < fdr_thresholds[ct])) 
