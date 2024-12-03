@@ -1152,3 +1152,14 @@ print(json.dumps({ct: f'{fdr:.2f}'
                   for ct, fdr in fdr_thresholds.items()}, indent=2))
 
 # (pl.col('FDR') < fdr_thresholds[ct])) 
+
+
+overlaps = {}
+for ct1 in de_genes:
+    for ct2 in de_genes:
+        if ct1 < ct2:
+            overlap = len(set(de_genes[ct1]) & set(de_genes[ct2]))
+            overlaps[f'{ct1}-{ct2}'] = overlap
+
+print('Gene overlaps between cell types:')
+print(json.dumps(overlaps, indent=2))
