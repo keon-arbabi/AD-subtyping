@@ -1154,12 +1154,190 @@ print(json.dumps({ct: f'{fdr:.2f}'
 # (pl.col('FDR') < fdr_thresholds[ct])) 
 
 
-overlaps = {}
-for ct1 in de_genes:
-    for ct2 in de_genes:
-        if ct1 < ct2:
-            overlap = len(set(de_genes[ct1]) & set(de_genes[ct2]))
-            overlaps[f'{ct1}-{ct2}'] = overlap
-
-print('Gene overlaps between cell types:')
+overlaps = {f'{ct1}-{ct2}': len(set(de_genes[ct1]) & set(de_genes[ct2]))
+           for ct1 in de_genes for ct2 in de_genes if ct1 < ct2}
 print(json.dumps(overlaps, indent=2))
+
+
+def project_tucker_ica_debug(tensor_dict, new_pb, de_genes, debug=True):
+    def log(msg):
+        if debug: print(msg)
+        
+    log("\n=== Starting Projection with Enhanced Debugging ===")
+    
+    # Track numerical stability
+    def check_numerical_health(arr, name):
+        log(f"\nNumerical health check for {name}:")
+        log(f"Shape: {arr.shape}")
+        log(f"Range: [{np.min(arr):.3e}, {np.max(arr):.3e}]")
+        log(f"Mean: {np.mean(arr):.3e}")
+        log(f"Std: {np.std(arr):.3e}")
+        log(f"NaNs: {np.sum(np.isnan(arr))}")
+        log(f"Infs: {np.sum(np.isinf(arr))}")
+        return not (np.any(np.isnan(arr)) or np.any(np.isinf(arr)))
+
+    # Initial setup and validation
+    ref_cell_types = set(tensor_dict['dims']['cell_types'])
+    new_cell_types = set(new_pb.keys())
+    if not ref_cell_types.issubset(new_cell_types):
+        raise ValueError(f'Missing cell types: {ref_cell_types - new_cell_types}')
+
+    # Gene overlap analysis
+    ref_genes = set(tensor_dict['dims']['genes'])
+    new_genes = set.intersection(*[set(var['_index']) for var in new_pb.iter_var()])
+    genes_use = sorted(ref_genes.intersection(new_genes))
+    
+    log(f"\nGene coverage analysis:")
+    log(f"Reference genes: {len(ref_genes)}")
+    log(f"New dataset genes: {len(new_genes)}")
+    log(f"Overlapping genes: {len(genes_use)} ({len(genes_use)/len(ref_genes):.1%} coverage)")
+
+    # Prepare new tensor using reference gene space
+    log("\nPreparing new tensor...")
+    new_tensor_dict = prepare_tensor_dict(
+        new_pb, 
+        genes=tensor_dict['dims']['genes'],  
+        donors=sorted(set.intersection(*[set(obs['ID']) for obs in new_pb.iter_obs()])))
+    
+    # Check initial tensor health
+    log("\nInitial tensor check:")
+    check_numerical_health(tensor_dict['tensor'], "Reference tensor")
+    check_numerical_health(new_tensor_dict['tensor'], "New tensor")
+    
+    # Apply padding with validation
+    log("\nApplying padding...")
+    ref_sparsity = {}
+    new_sparsity = {}
+    for ct_idx, ct in enumerate(tensor_dict['dims']['cell_types']):
+        ref_nonzero = np.sum(tensor_dict['tensor'][:,:,ct_idx] != 0) / tensor_dict['tensor'][:,:,ct_idx].size
+        new_nonzero = np.sum(new_tensor_dict['tensor'][:,:,ct_idx] != 0) / new_tensor_dict['tensor'][:,:,ct_idx].size
+        ref_sparsity[ct] = ref_nonzero
+        new_sparsity[ct] = new_nonzero
+        log(f"{ct} sparsity - Ref: {ref_nonzero:.2%}, New: {new_nonzero:.2%}")
+
+    new_tensor_dict = pad_tensor(new_tensor_dict, de_genes)
+    
+    # Check padding consistency
+    ref_mask = tensor_dict['masks']['padding']
+    new_mask = new_tensor_dict['masks']['padding']
+    mask_diff = np.sum(ref_mask != new_mask)
+    log(f"\nPadding mask differences: {mask_diff}")
+    
+    # Single normalization step
+    log("\nNormalizing tensors...")
+    new_tensor_dict = normalize_tensor(new_tensor_dict, min_shift=False)
+    
+    check_numerical_health(tensor_dict['tensor'], "Normalized reference tensor")
+    check_numerical_health(new_tensor_dict['tensor'], "Normalized new tensor")
+    
+    # Projection with stability checks
+    log("\nComputing projection...")
+    ldngs = tensor_dict['decomposition']['loadings']['unrotated']
+    check_numerical_health(ldngs, "Loadings matrix")
+    
+    # Unfold and project in chunks for numerical stability
+    log("\nComputing projection...")
+    ldngs = tensor_dict['decomposition']['loadings']['unrotated']
+    check_numerical_health(ldngs, "Loadings matrix")
+    
+    unfolded = tl.unfold(new_tensor_dict['tensor'], 0)
+    check_numerical_health(unfolded, "Unfolded tensor")
+    
+    # Direct projection instead of chunks since numerical stability looks good
+    projection = unfolded @ ldngs.T
+    check_numerical_health(projection, "Raw projection")
+    
+    # Normalize projection
+    norms = np.sqrt(np.sum(projection**2, axis=0))
+    projection = projection / norms[None, :]
+    check_numerical_health(projection, "Normalized projection")
+    
+    # Match variance of original decomposition
+    orig_scores = tensor_dict['decomposition']['factors']['donors']
+    orig_std = np.std(orig_scores, axis=0)
+    proj_std = np.std(projection, axis=0)
+    scale_factors = orig_std / proj_std
+    
+    log("\nScaling factors for variance matching:")
+    for i, sf in enumerate(scale_factors):
+        log(f"Factor {i+1}: {sf:.3f}")
+    
+    projection = projection * scale_factors[None, :]
+    check_numerical_health(projection, "Scaled projection")
+    
+    # Match variance of original decomposition
+    orig_scores = tensor_dict['decomposition']['factors']['donors']
+    orig_std = np.std(orig_scores, axis=0)
+    proj_std = np.std(projection, axis=0)
+    scale_factors = orig_std / proj_std
+    
+    log("\nScaling factors for variance matching:")
+    for i, sf in enumerate(scale_factors):
+        log(f"Factor {i+1}: {sf:.3f}")
+    
+    projection = projection * scale_factors[None, :]
+    check_numerical_health(projection, "Scaled projection")
+    
+    # Apply rotation
+    rot_mat = tensor_dict['decomposition']['rotations']['varimax']
+    check_numerical_health(rot_mat, "Rotation matrix")
+    
+    projected_scores = projection @ rot_mat
+    check_numerical_health(projected_scores, "Final projected scores")
+    
+    # Compare distributions
+    log("\nFinal distribution comparison:")
+    for i in range(projected_scores.shape[1]):
+        orig_factor = orig_scores[:, i]
+        proj_factor = projected_scores[:, i]
+        log(f"\nFactor {i+1}:")
+        log(f"Original - mean: {np.mean(orig_factor):.3e}, std: {np.std(orig_factor):.3e}")
+        log(f"Projected - mean: {np.mean(proj_factor):.3e}, std: {np.std(proj_factor):.3e}")
+    
+    # Store results
+    new_tensor_dict['decomposition'] = {
+        'factors': {
+            'donors': projected_scores,    
+            'genes': tensor_dict['decomposition']['factors']['genes'],     
+            'cell_types': tensor_dict['decomposition']['factors']['cell_types']
+        },
+        'core': tensor_dict['decomposition']['core'].copy(),
+        'loadings': tensor_dict['decomposition']['loadings'].copy(),
+        'rotations': tensor_dict['decomposition']['rotations'].copy()
+    }
+    
+    log("\n=== Projection Complete ===")
+    return new_tensor_dict
+
+tensor_dict_new = project_tucker_ica_debug(tensor_dict, lcpm, de_genes, debug=True)
+
+
+level = 'broad'
+coefficient = 'pmAD'
+
+pb_dict = {}; de_dict = {}
+for study in ['Green', 'Mathys']:
+    pb_dict[study] = Pseudobulk(f'{data_dir}/{study}/pseudobulk/{level}')\
+        .qc(group_column=pl.col(coefficient),
+            verbose=False)
+    de_dict[study] = pb_dict[study]\
+        .DE(formula=f'~ {coefficient} + age_death + sex + pmi + apoe4_dosage',
+            coefficient=coefficient,
+            group=coefficient,
+            verbose=False)
+    print_df(de_dict[study].get_num_hits(threshold=0.1).sort('cell_type'))
+
+de_genes = {
+    cell_type: (
+        de_dict['Green'].table
+            .filter(pl.col.cell_type.eq(cell_type))
+            .join(de_dict['Mathys'].table.filter(pl.col.cell_type.eq(cell_type)),
+                  on=['cell_type', 'gene'], 
+                  how='inner')
+            .filter((pl.col.FDR.lt(0.20) & pl.col.p_right.lt(0.05)) | 
+                    (pl.col.FDR_right.lt(0.20) & pl.col.p.lt(0.05)))
+            .filter(pl.col.logFC_right * pl.col.logFC > 0)
+            .get_column('gene').to_list())
+    for cell_type in de_dict['Green'].table['cell_type'].unique()
+}
+print(json.dumps({ct: len(genes) for ct, genes in de_genes.items()}, indent=2))

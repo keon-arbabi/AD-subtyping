@@ -7,17 +7,17 @@ import tensorly as tl
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-sys.path.append('/home/karbabi/projects/def-wainberg/karbabi/utils')
-from single_cell import SingleCell, Pseudobulk, set_num_threads
-from utils import debug, print_df, savefig, get_coding_genes
+sys.path.append('projects/utils')
+from single_cell import Pseudobulk, set_num_threads
+from utils import debug, print_df, savefig
 from ryp import r, to_r, to_py
 
 tl.set_backend('numpy') 
 set_num_threads(-1)
 debug(third_party=True)
 
-data_dir = f'{Path.home()}/projects/def-wainberg/single-cell'
-work_dir = f'{Path.home()}/projects/def-wainberg/karbabi/AD-subtyping'
+data_dir = f'{Path.home()}/projects/single-cell'
+work_dir = f'{Path.home()}/projects/AD-subtyping'
 
 ################################################################################
 
@@ -230,25 +230,28 @@ def run_tucker_ica(tensor_dict, ranks, random_state=42):
     })
     return tensor_dict
 
-# Get metadata associations with factor donor scores.
-def get_meta_associations(tensor_dict, meta, max_na_pct=0.2):
+def get_meta_associations(tensor_dict, meta, max_na_pct=0.4, adjust_pvals=True):
+    donor_ids = tensor_dict['dims']['donors']
+    meta = meta.filter(pl.col('ID').is_in(donor_ids))
+    meta = meta.sort('ID')
     if 'ID' in meta.columns:
         meta = meta.drop('ID')
+        
     donor_scores = tensor_dict['decomposition']['factors']['donors']
     to_r(donor_scores, 'donor_scores')
     to_r(meta, 'meta')
     to_r(max_na_pct, 'max_na_pct')
+    to_r(adjust_pvals, 'adjust_pvals')
 
     r('''
-    meta_rsq = function(donor_scores, meta, max_na_pct) {
+    meta_assoc = function(donor_scores, meta, na_thresh, adjust_pvals) {  
         na_pct = colMeans(is.na(meta))
-        vars_use = names(which(na_pct <= max_na_pct))
-        res = matrix(
-            0, 
-            nrow=length(vars_use), 
-            ncol=ncol(donor_scores),
-            dimnames=list(vars_use, 
-                          paste0('factor_', 1:ncol(donor_scores))))
+        vars_use = names(which(na_pct <= na_thresh))
+        
+        rsq = matrix(0, nrow=length(vars_use), ncol=ncol(donor_scores),
+                    dimnames=list(vars_use, colnames(donor_scores)))
+        cor = rsq  
+        pvals = rsq  
         
         for (var in vars_use) {
             complete = !is.na(meta[[var]])
@@ -257,108 +260,150 @@ def get_meta_associations(tensor_dict, meta, max_na_pct=0.2):
                       else 
                         meta[[var]][complete]
             
-            res[var,] = sapply(1:ncol(donor_scores), function(i) {
-                max(0, summary(
-                    lm(donor_scores[complete,i] ~ var_data)
-                )$adj.r.squared)
-            })
+            for(i in 1:ncol(donor_scores)) {
+                fit = lm(donor_scores[complete,i] ~ var_data)
+                r2 = summary(fit)$adj.r.squared
+                coef_matrix = summary(fit)$coefficients
+                
+                if(nrow(coef_matrix) > 1) {
+                    pvals[var,i] = coef_matrix[2,4]
+                    cor[var,i] = cor(donor_scores[complete,i], 
+                                   as.numeric(var_data), 
+                                   use="complete.obs")
+                    rsq[var,i] = sign(cor[var,i]) * max(0, r2)
+                } else {
+                    pvals[var,i] = 1
+                    cor[var,i] = 0
+                    rsq[var,i] = 0
+                }
+            }
         }
-        res
+        if(adjust_pvals) {
+            pvals = apply(pvals, 2, p.adjust, method="fdr")
+        }
+        dimnames(pvals) = dimnames(rsq)
+        
+        for(i in 1:ncol(rsq)) {
+            cat(sprintf("\nTop associations for Factor %d:\n", i))
+            idx = order(abs(rsq[,i]), decreasing=TRUE)[1:5]
+            for(j in idx) {
+                cat(sprintf("%s: R=%.3f, R²=%.3f, p=%.2e\n", 
+                    rownames(rsq)[j], cor[j,i], rsq[j,i], pvals[j,i]))
+            }
+        }
+        list(rsq=rsq, cor=cor, pvals=pvals)
     }
-    result = meta_rsq(donor_scores, meta, max_na_pct)
+    result = meta_assoc(donor_scores, meta, max_na_pct, adjust_pvals)
     ''')
 
     tensor_dict['meta_associations'] = to_py('result')
     return tensor_dict
 
-
-# Plot heatmap of donor scores with optional metadata annotations.
-def plot_donor_loadings_heatmap(tensor_dict, meta, filename, meta_vars=None):
-    if 'ID' in meta.columns:
-        meta = meta.drop('ID')
+def plot_donor_loadings_heatmap(tensor_dict, filename):
     donor_scores = tensor_dict['decomposition']['factors']['donors']
+    meta_assoc = tensor_dict['meta_associations']
+    
     to_r(donor_scores, 'donor_scores', 
-         rownames=tensor_dict['dims']['donors'],
+         rownames=tensor_dict['dims']['donors'], 
          colnames=[f'Factor {i+1}' for i in range(donor_scores.shape[1])])
-    to_r(tensor_dict['meta_associations'].drop('index'), 'rsq', 
-         rownames=tensor_dict['meta_associations']['index'])
-    if meta_vars is not None:
-        to_r(meta.select(meta_vars), 'meta')
-    else:
-        r('meta = NULL')
+    to_r(meta_assoc['rsq'].drop('index'), 'result_rsq', 
+         rownames=meta_assoc['rsq']['index'].to_list())
+    to_r(meta_assoc['pvals'].drop('index'), 'result_pvals',
+         rownames=meta_assoc['pvals']['index'].to_list())
     to_r(filename, 'filename')
-
+    
     r('''
     suppressPackageStartupMessages({
-        library(ComplexHeatmap)
-        library(circlize)
-        library(grid)
+      library(ComplexHeatmap)
+      library(circlize)
+      library(grid)
     })
+
+    rsq_lim = quantile(abs(as.matrix(result_rsq)), 0.99)
+    rsq_colors = colorRamp2(
+      c(-rsq_lim, 0, rsq_lim),
+      c('#7B3294', 'white', '#008837')
+    )
     
     score_lim = quantile(abs(donor_scores), 0.99)
     score_colors = colorRamp2(
-        c(-score_lim, 0, score_lim),
-        c('blue', 'white', 'red')
+      c(-score_lim, 0, score_lim),
+      c('blue', 'white', 'red')
     )
-    rsq_lim = quantile(as.matrix(rsq), 0.99)
-    rsq_colors = colorRamp2(
-        c(0, rsq_lim),
-        c('white', '#1B7837')
-    )
-      
+    
     ha_list = list()
-    if (!is.null(meta)) {
-        ha_list$meta = rowAnnotation(
-            df = meta,
-            show_legend = FALSE,
-            annotation_name_gp = gpar(fontsize = 8),
-            simple_anno_size = unit(0.25, 'cm')
-        )
-    }    
     ha_list$rsq = HeatmapAnnotation(
-        rsq = t(rsq),
-        col = list(rsq = rsq_colors),
-        show_legend = TRUE,
-        annotation_name_gp = gpar(fontsize = 8),
-        simple_anno_size = unit(0.25, 'cm')
+      rsq = t(result_rsq),
+      col = list(rsq = rsq_colors),
+      show_legend = TRUE,
+      annotation_name_gp = gpar(fontsize = 8),
+      simple_anno_size = unit(0.3, 'cm'),
+      annotation_legend_param = list(
+        title_gp = gpar(fontsize = 8, fontface = "bold"),
+        labels_gp = gpar(fontsize = 8)
+      )
     )
     
     ht = Heatmap(
-        donor_scores,
-        name = 'loading',
-        col = score_colors,
-        cluster_columns = FALSE,
-        show_row_names = FALSE,
-        row_title = 'Donors',
-        row_title_gp = gpar(fontsize = 8),
-        column_title = NULL,
-        column_names_gp = gpar(fontsize = 8),
-        top_annotation = ha_list$rsq,
-        left_annotation = ha_list$meta,
-        clustering_method_rows = 'ward.D2',
-        show_row_dend = FALSE,
-        width = unit(6, "cm"), height = unit(10, "cm")
+      donor_scores,
+      name = 'loading',
+      col = score_colors,
+      cluster_columns = FALSE,
+      show_row_names = FALSE,
+      row_title = sprintf('Donors (N=%d)', nrow(donor_scores)),
+      row_title_gp = gpar(fontsize = 8),
+      column_title = NULL,
+      column_names_gp = gpar(fontsize = 8),
+      top_annotation = ha_list$rsq,
+      clustering_method_rows = 'ward.D2',
+      show_row_dend = FALSE,
+      heatmap_legend_param = list(
+        title_gp = gpar(fontsize = 8, fontface = "bold"),
+        labels_gp = gpar(fontsize = 8)
+      ),
+      width = unit(6, "cm"),
+      height = unit(10, "cm")
     )
-    ''')
     
-    r(f'''
     png(filename, units='cm', width=20, height=30, res=300)
     draw(ht, 
          heatmap_legend_side = "right",
          annotation_legend_side = "right",
-         padding = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+         padding = unit(c(0.5, 0.5, 2, 0.5), "cm"),
          auto_adjust = FALSE)
+         
+    decorate_annotation("rsq", {
+      pvals = result_pvals
+      for(i in 1:nrow(pvals)) {
+        for(j in 1:ncol(pvals)) {
+          v = pvals[i,j]
+          if(!is.na(v) && !is.null(v)) { 
+            y_pos = 1 - ((i-0.5)/nrow(pvals))
+            x_pos = (j-0.5)/ncol(pvals)
+            
+            if(v < 0.001) {
+              grid.text("***", x = unit(x_pos, "npc"), y = unit(y_pos, "npc"),
+                       gp = gpar(fontsize = 8, col = "white"))
+            } else if(v < 0.01) {
+              grid.text("**", x = unit(x_pos, "npc"), y = unit(y_pos, "npc"),
+                       gp = gpar(fontsize = 8, col = "white"))
+            } else if(v < 0.05) {
+              grid.text("*", x = unit(x_pos, "npc"), y = unit(y_pos, "npc"),
+                       gp = gpar(fontsize = 8, col = "white"))
+            }
+          }
+        }
+      }
+    })
     dev.off()
     ''')
 
-# Plot gene loadings heatmap for each factor across cell type
 def plot_gene_loadings_heatmap(tensor_dict, filename, n_genes_per_factor=10):
     loading_tensor = tensor_dict['decomposition']['loadings']['tensor']
     n_factors = loading_tensor.shape[0]
     genes = tensor_dict['dims']['genes']
     cell_types = tensor_dict['dims']['cell_types']
     
-    # Get top genes based on loading magnitudes for each factor-cell type combo
     top_genes = {}
     for f in range(n_factors):
         factor_loadings = loading_tensor[f]  
@@ -573,17 +618,19 @@ def plot_donor_sig_genes(tensor_dict, filename, n_genes_per_ct=10,
 
 def plot_scores_by_meta(tensor_dict, filename, meta, meta_var, factors=None):
     donor_scores = tensor_dict['decomposition']['factors']['donors']
+    donor_ids = tensor_dict['dims']['donors']
+    
+    meta = meta.filter(pl.col('ID').is_in(donor_ids))
+    meta = meta.sort('ID')
+    
     if factors is not None:
-        if isinstance(factors, int):
-            factors = [factors]
-        factor_idx = [i-1 for i in factors]
-        donor_scores = donor_scores[:, factor_idx]
-        factor_names = [f'Factor_{i}' for i in factors]
+        donor_scores = donor_scores[:, [f-1 for f in factors]]
+        factor_names = [f'Factor {f}' for f in factors]
     else:
-        factor_names = [f'Factor_{i+1}' for i in range(donor_scores.shape[1])]
+        factor_names = [f'Factor {i+1}' for i in range(donor_scores.shape[1])]
     
     to_r(donor_scores, 'donor_scores', 
-         rownames=tensor_dict['dims']['donors'],
+         rownames=donor_ids,
          colnames=factor_names)
     to_r(meta, 'meta')
     to_r(meta_var, 'meta_var')
@@ -595,9 +642,8 @@ def plot_scores_by_meta(tensor_dict, filename, meta, meta_var, factors=None):
     
     complete_idx = !is.na(meta[[meta_var]])
     meta_subset = meta[complete_idx, ]
-    scores_subset = as.matrix(donor_scores[complete_idx, , drop=FALSE])
+    scores_subset = donor_scores[complete_idx, , drop=FALSE]
     meta_val = meta_subset[[meta_var]]
-    
     n_unique = length(unique(meta_val))
     is_categorical = n_unique < 8
     
@@ -613,7 +659,6 @@ def plot_scores_by_meta(tensor_dict, filename, meta, meta_var, factors=None):
             dscore = scores_subset[,1],
             meta_val = meta_val
         )
-        
         if (is_categorical) {
             p = ggplot(plot_data, aes(x=meta_val, y=dscore)) +
                 geom_boxplot(width=0.5, outlier.shape=NA) +
@@ -635,8 +680,7 @@ def plot_scores_by_meta(tensor_dict, filename, meta, meta_var, factors=None):
                 theme_classic() +
                 theme(plot.title = element_text(hjust = 0.5))
         }
-        ggsave(filename, p, width = 3, 
-               height = 5, dpi = 300)
+        ggsave(filename, p, width = 3, height = 5, dpi = 300)
     } else {
         plot_list = list()
         for (i in 1:ncol(scores_subset)) {
@@ -681,6 +725,66 @@ def plot_scores_by_meta(tensor_dict, filename, meta, meta_var, factors=None):
     }
     ''')
 
+def project_tucker_ica(tensor_dict, new_pb, de_genes):
+    ref_cell_types = set(tensor_dict['dims']['cell_types'])
+    new_cell_types = set(new_pb.keys())
+    if not ref_cell_types.issubset(new_cell_types):
+        missing = ref_cell_types - new_cell_types
+        raise ValueError(f'Missing cell types in new data: {missing}')
+    
+    ref_genes = set(tensor_dict['dims']['genes'])
+    new_genes = set.intersection(*[
+        set(var['_index'])for var in new_pb.iter_var()])
+    genes_use = sorted(ref_genes.intersection(new_genes))
+    
+    new_tensor_dict = prepare_tensor_dict(
+        new_pb, 
+        genes=genes_use,
+        donors=sorted(set.intersection(
+            *[set(obs['ID']) for obs in new_pb.iter_obs()])))
+    new_tensor_dict = pad_tensor(new_tensor_dict, de_genes)
+    new_tensor_dict = normalize_tensor(new_tensor_dict, min_shift=False)
+    
+    # Get unrotated loadings
+    ldngs = tensor_dict['decomposition']['loadings']['unrotated'] 
+
+    # Create gene:celltype labels and get column indices
+    ref_ct_g = []
+    for ct in tensor_dict['dims']['cell_types']:
+        for g in tensor_dict['dims']['genes']:
+            ref_ct_g.append(f'{ct}:{g}')
+
+    new_ct_g, col_idx = [], []
+    for ct in tensor_dict['dims']['cell_types']:
+        for g in genes_use:
+            new_ct_g.append(f'{ct}:{g}')
+            if f'{ct}:{g}' in ref_ct_g:
+                col_idx.append(ref_ct_g.index(f'{ct}:{g}'))
+    
+    # Subset loadings to matching genes/cell types
+    ldngs = ldngs[:, col_idx]
+    # Project new data
+    unfolded = tl.unfold(new_tensor_dict['tensor'], 0)
+    projection = unfolded @ ldngs.T
+    # Normalize projections
+    norms = np.sqrt(np.sum(projection**2, axis=0))
+    projection = projection / norms[None, :]
+    # Apply rotation matrix
+    rot_mat = tensor_dict['decomposition']['rotations']['varimax']
+    projected_scores = projection @ rot_mat
+
+    new_tensor_dict['decomposition'] = {
+        'factors': {
+            'donors': projected_scores,    # New donor projections
+            'genes': tensor_dict['decomposition']['factors']['genes'],     
+            'cell_types': tensor_dict['decomposition']['factors']['cell_types']
+        },
+        'core': tensor_dict['decomposition']['core'].copy(),
+        'loadings': tensor_dict['decomposition']['loadings'].copy(),
+        'rotations': tensor_dict['decomposition']['rotations'].copy()
+    }
+    return new_tensor_dict
+
 def get_gene_loading_table(tensor_dict):
     loading_tensor = tensor_dict['decomposition']['loadings']['tensor']
     genes = tensor_dict['dims']['genes']
@@ -711,14 +815,29 @@ def get_donor_loading_table(tensor_dict):
 
 ################################################################################
 
-
 study_name = 'SEAAD'
 level = 'broad'
-formula = '~ `Consensus Clinical AD` + `Age_death` + `Sex` + `PMI` + `APOE4_Dosage`'
-de = Pseudobulk(f'{data_dir}/{study_name}/pseudobulk/{level}')\
+
+pb = Pseudobulk(f'{data_dir}/{study_name}/pseudobulk/{level}')\
+    .with_columns_obs(
+        pl.when(pl.col('Fresh Brain Weight').eq('Unavailable')).then(None)
+            .otherwise(pl.col('Fresh Brain Weight'))
+            .cast(pl.Float64)
+            .fill_null(strategy='mean')
+            .alias('Fresh Brain Weight'),
+        pl.when(pl.col('Brain pH').eq('Reference')).then(None)
+            .otherwise(pl.col('Brain pH'))
+            .cast(pl.Float64)
+            .fill_null(strategy='mean')
+            .alias('Brain pH'))\
     .qc(group_column=None,
-        custom_filter=pl.col('Severely Affected Donor').eq(0) &
-        pl.col('Consensus Clinical AD').is_not_null())\
+        custom_filter=pl.col('Severely Affected Donor').eq(0))
+
+formula = '~ `Continuous Pseudo-progression Score` + Age_death + Sex + ' \
+    'APOE4_Dosage + PMI + RIN + `Brain pH`'
+
+de = pb\
+    .filter_obs(pl.col('Continuous Pseudo-progression Score').is_not_null())\
     .DE(formula=formula,
         coefficient=0,
         group=False)
@@ -731,24 +850,20 @@ de_genes = {
         .to_list()
     for ct in de.table['cell_type'].unique()
 }
-print(json.dumps({ct: len(genes) for ct, genes in de_genes.items()}, indent=2))
 
-lcpm = Pseudobulk(f'{data_dir}/{study_name}/pseudobulk/{level}')\
+print(json.dumps({
+    ct: len(genes) for ct, genes in de_genes.items()}, indent=2))
+print(json.dumps({
+    f'{ct1}-{ct2}': round(
+        100 * len(set(de_genes[ct1]) & set(de_genes[ct2])) /
+        len(set(de_genes[ct1]) | set(de_genes[ct2])), 1)
+    for ct1 in de_genes for ct2 in de_genes if ct1 < ct2}, indent=2))
+
+lcpm = pb\
     .log_CPM()\
-    .with_columns_obs(
-        pl.when(pl.col('Fresh Brain Weight').eq('Unavailable')).then(None)
-            .otherwise(pl.col('Fresh Brain Weight'))
-            .cast(pl.Float64)
-            .fill_null(strategy='mean')
-            .alias('Fresh Brain Weight'),
-        pl.when(pl.col('Brain pH').eq('Reference')).then(None)
-            .otherwise(pl.col('Brain pH'))
-            .cast(pl.Float64)
-            .fill_null(strategy='mean')
-            .alias('Brain pH'))\
-    .regress_out('~ PMI + RIN + `Fresh Brain Weight` + `Brain pH`',
+    .regress_out('~ PMI + RIN + `Brain pH` + `Fresh Brain Weight`',
                  library_size_as_covariate=True,
-                 num_cells_as_covariate=True) 
+                 num_cells_as_covariate=True)
 
 genes = sorted(set().union(*[
     set(gene_list) for gene_list in de_genes.values()
@@ -762,13 +877,6 @@ tensor_dict = normalize_tensor(tensor_dict, min_shift=False)
 print(tensor_dict['tensor'].shape)
 print(np.max(tensor_dict['tensor']), np.min(tensor_dict['tensor']))
 
-# best_ranks = determine_ranks_svd(
-#     tensor_dict, 
-#     f'{work_dir}/figures/svd_ranks.png',
-#     max_ranks=(50, 100)) \
-    
-# print(best_ranks)
-
 tensor_dict = run_tucker_ica(tensor_dict, ranks=[6, 30, 7])
 
 codes = pl.read_csv(f'{data_dir}/{study_name}/codes.csv')\
@@ -776,20 +884,19 @@ codes = pl.read_csv(f'{data_dir}/{study_name}/codes.csv')\
 meta = lcpm.obs[next(iter(lcpm.keys()))]\
     .select(['ID'] + codes['name'].to_list())
 
-tensor_dict = get_meta_associations(tensor_dict, meta, max_na_pct=0.4)
+tensor_dict = get_meta_associations(
+    tensor_dict, meta, max_na_pct=0.4, adjust_pvals=False)
 
 plot_donor_loadings_heatmap(
     tensor_dict, 
-    meta,
-    f'{work_dir}/figures/donor_loadings.png',
-    meta_vars=None)
+    f'{work_dir}/figures/donor_loadings.png')
 
 plot_scores_by_meta(
     tensor_dict,
     f'{work_dir}/figures/scores_by_var.png',
     meta,
-    factors=[3,4,5],
-    meta_var='Total microinfarcts in screening sections')
+    factors=[1,2,3,4,5],
+    meta_var='')
 
 plot_gene_loadings_heatmap(
     tensor_dict, 
@@ -806,6 +913,158 @@ plot_donor_sig_genes(
 
 
 
+study_name = 'Green'
+level = 'broad'
+
+lcpm = Pseudobulk(f'{data_dir}/{study_name}/pseudobulk/{level}')\
+    .filter_obs((pl.col('cogdx').is_between(2, 5) & 
+                 pl.col('cogdx').is_not_null()))\
+    .qc(group_column=None, verbose=False)\
+    .log_CPM()\
+    .regress_out('~ pmi',
+                 library_size_as_covariate=True,
+                 num_cells_as_covariate=True) 
+
+tensor_dict_new = project_tucker_ica(tensor_dict, lcpm, de_genes)
+
+rosmap_codes = pl.read_csv(
+    f'{data_dir}/Green/rosmap_codes_edits.csv')\
+    .filter(pl.col.priority | pl.col.code.is_in(['pmi']))\
+    .with_columns(pl.col.name.str.replace_all(' - OLD', ''))\
+    .select(['code', 'name', 'category'])
+code_to_name = dict(rosmap_codes.select(['code', 'name']).iter_rows())
+
+meta = lcpm.obs[next(iter(lcpm.keys()))]\
+    .filter(pl.col.ID.is_in(tensor_dict_new['dims']['donors']))\
+    .select(['ID'] + rosmap_codes['code'].to_list())\
+    .rename(code_to_name)\
+    .with_columns([
+        pl.col('CERAD score').reverse().alias('CERAD score'),
+        pl.col('NIA-Reagan diagnosis of AD').reverse()
+        .alias('NIA-Reagan diagnosis of AD')])
+meta = meta.select(['ID'] + sorted(set(meta.columns) - {'ID'}))
+
+tensor_dict_new = get_meta_associations(tensor_dict_new, meta, max_na_pct=0.4)
+
+plot_donor_loadings_heatmap(
+    tensor_dict_new, 
+    f'{work_dir}/figures/donor_loadings_proj_{study_name}.png')
+
+
+
+
+# Get neuropath correlations
+donor_ids = tensor_dict['dims']['donors']
+neuropath = pl.read_csv(f'{data_dir}/SEAAD/'
+    'sea-ad_all_mtg_quant_neuropath_bydonorid_081122.csv')\
+    .rename({'Donor ID': 'ID'})\
+    .filter(pl.col('ID').is_in(donor_ids))\
+    .join(pl.DataFrame({'ID': donor_ids, '__order': range(len(donor_ids))}),
+          on='ID')\
+    .sort('__order')\
+    .drop('__order')
+assert neuropath['ID'].to_list() == donor_ids
+
+donor_scores = tensor_dict['decomposition']['factors']['donors']
+to_r(donor_scores, 'donor_scores', rownames=donor_ids)
+to_r(neuropath.drop('ID'), 'meta')
+to_r(f'{work_dir}/figures/neuropath.png', 'filename')
+
+r('''
+suppressPackageStartupMessages({
+    library(ComplexHeatmap)
+    library(circlize)
+    library(grid)
+})
+
+result = meta_assoc(donor_scores, meta, max_na_pct, adjust_pvals=FALSE)
+rsq_mat = result$rsq 
+pvals_mat = result$pvals  
+
+top_vars = names(sort(abs(rowMeans(rsq_mat)), decreasing=TRUE)[1:90])
+result_subset = rsq_mat[top_vars,]
+pvals_subset = pvals_mat[top_vars,]
+
+rsq_lim = quantile(abs(as.matrix(result_subset)), 0.99)
+rsq_colors = colorRamp2(
+    c(-rsq_lim, 0, rsq_lim),
+    c('#7B3294', 'white', '#008837')
+)
+
+row_fontfaces = ifelse(
+    grepl('aSyn|pTDP|pTAU|6e10|AT8', rownames(result_subset), ignore.case=TRUE),
+    'bold', 'plain'
+)
+
+ht = Heatmap(
+    result_subset,
+    name = 'rsq',
+    col = rsq_colors,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    show_row_dend = FALSE,  
+    row_names_gp = gpar(fontsize = 8, fontface = row_fontfaces),
+    column_names_gp = gpar(fontsize = 8),
+    row_title = 'Neuropathology',  
+    row_title_gp = gpar(fontsize = 10),
+    column_labels = paste0('Factor ', 1:ncol(result_subset)), 
+    row_names_max_width = unit(15, 'cm'),
+    width = unit(8, 'cm'),
+    height = unit(20, 'cm'),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+        v = pvals_subset[i, j]
+        if(!is.null(v)) {
+            if(v < 0.001) {
+                grid.text("***", x, y, gp = gpar(fontsize = 8, col = "white",
+                                                fontface='bold'))
+            } else if(v < 0.01) {
+                grid.text("**", x, y, gp = gpar(fontsize = 8, col = "white",
+                                                fontface='bold'))
+            } else if(v < 0.05) {
+                grid.text("*", x, y, gp = gpar(fontsize = 8, col = "white",
+                                               fontface='bold'))
+            }
+        }
+    }
+)
+
+png(filename, width=12, height=10, units='in', res=300)
+draw(ht, padding = unit(c(2, 2, 2, 2), 'mm'),
+     heatmap_legend_side = "left",
+     annotation_legend_side = "left")
+dev.off()
+
+for (i in 1:ncol(rsq_mat)) {
+    cat(sprintf("\nTop correlations for Factor %d:\n", i))
+    top5 = sort(rsq_mat[,i], decreasing=TRUE)[1:5]
+    print(round(top5, 3))
+}
+''')
+
+
+
+plot_scores_by_meta(
+    tensor_dict,
+    f'{work_dir}/figures/scores_by_var.png',
+    meta,
+    factors=[1,2,3,4,5,6],
+    meta_var='Continuous Pseudo-progression Score')
+
+plot_scores_by_meta(
+    tensor_dict,
+    f'{work_dir}/figures/scores_by_neuropath.png',
+    neuropath,
+    factors=[1,2,3,4,5,6],
+    meta_var='total pTDP43 positive area_Layer2')
+
+# 'total aSyn positive area_Grey matter'
+# 'total NeuN positive area_Grey matter'
+# 'total AT8 positive area_Grey matter'
+# 'total pTDP43 positive area_Grey matter'
+# 'total pTAU positive area_Grey matter'
+
+
+
 
 
 get_gene_loading_table(tensor_dict)\
@@ -819,97 +1078,57 @@ get_gene_loading_table(tensor_dict)\
 sample_loading_table = get_donor_loading_table(tensor_dict)
 
 
-# Get neuropath correlations
-donor_ids = tensor_dict['dims']['donors']
-neuropath = pl.read_csv(f'{data_dir}/{study_name}/'
-    'sea-ad_all_mtg_quant_neuropath_bydonorid_081122.csv')\
-    .rename({'Donor ID': 'ID'})\
-    .filter(pl.col('ID').is_in(donor_ids))\
-    .join(pl.DataFrame({'ID': donor_ids, '__order': range(len(donor_ids))}),
-          on='ID')\
-    .sort('__order')\
-    .drop('__order')
-assert neuropath['ID'].to_list() == donor_ids
 
-donor_scores = tensor_dict['decomposition']['factors']['donors']
-to_r(donor_scores, 'donor_scores', rownames=donor_ids)
-to_r(neuropath.drop('ID'), 'meta')
-to_r(0.4, 'max_na_pct')
-to_r(f'{work_dir}/figures/neuropath_correlations.png', 'filename')
-
-r('''
-suppressPackageStartupMessages({
-    library(ComplexHeatmap)
-    library(circlize)
-    library(grid)
-})
-
-meta_rsq = function(donor_scores, meta, max_na_pct) {
-    na_pct = colMeans(is.na(meta))
-    vars_use = names(which(na_pct <= max_na_pct))
-    res = matrix(
-        0, 
-        nrow=length(vars_use), 
-        ncol=ncol(donor_scores),
-        dimnames=list(vars_use, paste0('factor_', 1:ncol(donor_scores)))
-    )
-    
-    for (var in vars_use) {
-        complete = !is.na(meta[[var]])
-        var_data = if(is.character(meta[[var]])) 
-                    factor(meta[[var]][complete]) 
-                  else 
-                    meta[[var]][complete]
-        
-        res[var,] = sapply(1:ncol(donor_scores), function(i) {
-            fit = lm(donor_scores[complete,i] ~ var_data)
-            r2 = summary(fit)$adj.r.squared
-            sign = sign(coef(fit)[2])
-            return(sign * max(0, r2))
-        })
-    }
-    res
-}
-
-result = meta_rsq(donor_scores, meta, max_na_pct)
-
-top_vars = names(sort(abs(rowMeans(result)), decreasing=TRUE)[1:30])
-result_subset = result[top_vars,]
-
-rsq_lim = quantile(abs(as.matrix(result_subset)), 0.99)
-rsq_colors = colorRamp2(
-    c(-rsq_lim, 0, rsq_lim),
-    c('#7B3294', 'white', '#008837')
-)
-
-ht = Heatmap(
-    result_subset,
-    name = 'Signed R²',
-    col = rsq_colors,
-    cluster_rows = TRUE,
-    cluster_columns = FALSE,
-    row_names_gp = gpar(fontsize = 8),
-    column_names_gp = gpar(fontsize = 8),
-    row_names_max_width = unit(15, 'cm'),
-    width = unit(8, 'cm'),
-    height = unit(15, 'cm'),
-    column_title = 'Neuropathology Associations',
-    column_title_gp = gpar(fontsize = 10, fontface = 'bold')
-)
-
-png(filename, width=12, height=10, units='in', res=300)
-draw(ht, padding = unit(c(2, 2, 2, 2), 'mm'))
-dev.off()
-
-for (i in 1:ncol(result)) {
-    cat(sprintf("\nTop correlations for Factor %d:\n", i))
-    top5 = sort(result[,i], decreasing=TRUE)[1:5]
-    print(round(top5, 3))
-}
-''')
+# best_ranks = determine_ranks_svd(
+#     tensor_dict, 
+#     f'{work_dir}/figures/svd_ranks.png',
+#     max_ranks=(50, 100)) 
+# print(best_ranks)
 
 
+data = tl.unfold(tensor_dict['decomposition']['loadings']['loadings_unrotated'], 1).T
 
 
+data = tl.unfold(tensor_dict['tensor'], 0).T
+print(data.shape)
 
+plt.clf()
+plt.figure(figsize=(8, 11))
+sns.heatmap(data, 
+            cmap='RdBu_r',
+            center=0,
+            robust=True,
+            xticklabels=False,
+            yticklabels=False)
+plt.title('Tensor data')
+plt.xlabel('Donors')
+plt.ylabel('Genes x Cell types')
+savefig(f'{work_dir}/figures/tmp1.png')
 
+data = tl.unfold(tensor_dict['tensor'], 2).T
+print(data.shape)
+
+plt.clf()
+plt.figure(figsize=(8, 11))
+sns.heatmap(data, 
+            cmap='RdBu_r',
+            center=0,
+            robust=True,
+            xticklabels=tensor_dict['dims']['cell_types'],
+            yticklabels=False)
+plt.title('Tensor data')
+plt.xlabel('Cell types')
+plt.ylabel('Genes x Donors')
+plt.xticks(rotation=45, ha='right')
+savefig(f'{work_dir}/figures/tmp2.png')
+
+import sys
+sys.setrecursionlimit(10000)
+plt.figure(figsize=(8, 15))
+sns.clustermap(data,
+               cmap='RdBu_r', 
+               center=0,
+               robust=True,
+               xticklabels=False,
+               yticklabels=False)
+savefig(f'{work_dir}/figures/tmp1_clust.png')
